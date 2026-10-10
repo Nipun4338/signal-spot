@@ -1,0 +1,43 @@
+/* The basemap is a light style, so the page is light-only for now. */
+:root {
+  color-scheme: light;
+  --surface: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --border: #e4e3df;
+  --shadow: 0 1px 6px rgb(0 0 0 / 0.15);
+  font-family: system-ui, -apple-system, 'Segoe UI', sans-serif;
+  color: var(--text-primary);
+}
+
+* { box-sizing: border-box; }
+html, body, #root { margin: 0; height: 100%; background: var(--surface); }
+
+.app { position: relative; height: 100%; }
+.map { position: absolute; inset: 0; }
+
+.panel {
+  position: absolute;
+  background: var(--surface);
+  border-radius: 12px;
+  box-shadow: var(--shadow);
+  padding: 10px 14px;
+}
+
+.title { top: 12px; left: 12px; }
+.title h1 { margin: 0; font-size: 1.05rem; }
+.title p { margin: 2px 0 0; font-size: 0.8rem; color: var(--text-secondary); }
+
+.legend { bottom: 28px; left: 12px; font-size: 0.8rem; max-width: calc(100% - 24px); }
+.legend h2 { margin: 0 0 6px; font-size: 0.8rem; }
+.legend ul { list-style: none; margin: 0; padding: 0; display: grid; gap: 4px; }
+.legend li { display: flex; align-items: center; gap: 8px; }
+.legend p { margin: 6px 0 0; color: var(--text-secondary); }
+.swatch { width: 14px; height: 14px; border-radius: 4px; flex-shrink: 0; }
+
+.status { top: 50%; left: 50%; transform: translate(-50%, -50%); margin: 0; }
+
+.tile-summary { font: 0.8rem system-ui, sans-serif; color: var(--text-primary); min-width: 150px; }
+.tile-summary-heading { font-weight: 600; margin-bottom: 4px; }
+.tile-summary-row { display: flex; justify-content: space-between; gap: 12px; }
+.tile-summary-note { margin-top: 4px; color: var(--text-secondary); }
