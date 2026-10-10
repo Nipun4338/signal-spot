@@ -1,0 +1,219 @@
+<!doctype html>
+<!-- PROTOTYPE — two-device Wi-Fi test. Throwaway. -->
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>PROTOTYPE · Wi-Fi pair test</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 16px; max-width: 640px; }
+  button { font: inherit; padding: 12px 16px; border-radius: 10px; border: 1px solid #111; background: #fff; margin: 4px 4px 4px 0; }
+  button.primary { background: #111; color: #fff; }
+  button:disabled { opacity: 0.4; }
+  input { font: inherit; padding: 10px; border: 1px solid #ccc; border-radius: 8px; width: 100%; box-sizing: border-box; margin: 8px 0; }
+  table { border-collapse: collapse; width: 100%; font-size: 0.85rem; margin-top: 12px; }
+  th, td { border-bottom: 1px solid #eee; padding: 6px 4px; text-align: right; }
+  th:first-child, td:first-child { text-align: left; }
+  #status { padding: 10px; border-radius: 8px; background: #f3f4f6; margin: 12px 0; }
+  .bad { background: #fee2e2 !important; }
+  .good { background: #dcfce7 !important; }
+  pre { background: #111; color: #a7f3d0; padding: 8px; font-size: 0.7rem; max-height: 30vh; overflow: auto; white-space: pre-wrap; }
+  .tag { position: fixed; top: 0; right: 0; background: #ff2e88; color: #fff; font: 600 0.7rem monospace; padding: 2px 6px; }
+</style>
+</head>
+<body>
+<div class="tag">PROTOTYPE</div>
+<h2>Wi-Fi pair test</h2>
+<div id="choose">
+  <p>Open this page on two devices on the same Wi-Fi.</p>
+  <button class="primary" onclick="start('anchor')">This device stays by the router (anchor)</button>
+  <button class="primary" onclick="start('walker')">This device walks Room to Room</button>
+  <p><button onclick="resetAll()">Reset pairing</button></p>
+</div>
+<div id="status" hidden></div>
+<div id="walker" hidden>
+  <input id="room" placeholder="Room name, e.g. Bedroom" />
+  <button class="primary" id="go" onclick="testRoom()" disabled>Test this Room (~12 s)</button>
+  <table>
+    <thead><tr><th>Room</th><th>RTT ms</th><th>Jitter ms</th><th>Loss %</th><th>↓ Mbps</th><th>↑ Mbps</th><th>Path</th></tr></thead>
+    <tbody id="rows"></tbody>
+  </table>
+  <p><button onclick="copyResults()">Copy results</button></p>
+</div>
+<pre id="log"></pre>
+<script>
+const $ = (s) => document.querySelector(s);
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const log = (...a) => { $('#log').textContent += a.join(' ') + '\n'; };
+const status = (t, cls = '') => { const s = $('#status'); s.hidden = false; s.textContent = t; s.className = cls; };
+
+let role, pc, ctrl, bulk, probe;
+const results = [];
+const waiters = {};
+const ctrlWait = (t) => new Promise((r) => (waiters[t] = r));
+
+async function post(to, msg) { await fetch('/signal/' + to, { method: 'POST', body: JSON.stringify(msg) }); }
+async function resetAll() { await fetch('/reset', { method: 'POST' }); location.reload(); }
+
+function gathered(pc) {
+  return new Promise((r) => {
+    if (pc.iceGatheringState === 'complete') return r();
+    pc.addEventListener('icegatheringstatechange', () => pc.iceGatheringState === 'complete' && r());
+    setTimeout(r, 3000);
+  });
+}
+
+async function start(r) {
+  role = r;
+  $('#choose').hidden = true;
+  navigator.wakeLock?.request('screen').catch(() => log('wake lock unavailable'));
+  // No STUN/TURN: the connection can only form on the local network.
+  pc = new RTCPeerConnection({ iceServers: [] });
+  pc.onconnectionstatechange = () => {
+    log('connection:', pc.connectionState);
+    if (pc.connectionState === 'failed') status('Could not connect locally. Guest network or router "client isolation" may block device-to-device traffic.', 'bad');
+  };
+  if (role === 'walker') {
+    ctrl = pc.createDataChannel('ctrl');
+    bulk = pc.createDataChannel('bulk');
+    probe = pc.createDataChannel('probe', { ordered: false, maxRetransmits: 0 });
+    wire();
+    await pc.setLocalDescription(await pc.createOffer());
+    await gathered(pc);
+    log('offer candidates:', (pc.localDescription.sdp.match(/a=candidate.*/g) || []).join('\n  '));
+    await post('anchor', pc.localDescription);
+    status('Waiting for the anchor device…');
+    await pollFor('walker', async (answer) => { await pc.setRemoteDescription(answer); });
+  } else {
+    pc.ondatachannel = (e) => {
+      if (e.channel.label === 'ctrl') ctrl = e.channel;
+      if (e.channel.label === 'bulk') bulk = e.channel;
+      if (e.channel.label === 'probe') probe = e.channel;
+      if (ctrl && bulk && probe) wire();
+    };
+    status('Anchor ready. Now choose "walks Room to Room" on the other device.');
+    await pollFor('anchor', async (offer) => {
+      await pc.setRemoteDescription(offer);
+      await pc.setLocalDescription(await pc.createAnswer());
+      await gathered(pc);
+      await post('walker', pc.localDescription);
+    });
+  }
+}
+
+async function pollFor(me, handle) {
+  for (;;) {
+    const msgs = await fetch('/signal/' + me).then((r) => r.json());
+    if (msgs.length) { await handle(JSON.parse(msgs[msgs.length - 1])); return; }
+    await sleep(500);
+  }
+}
+
+let up = null;
+function wire() {
+  for (const ch of [ctrl, bulk, probe]) ch.binaryType = 'arraybuffer';
+  ctrl.onopen = async () => {
+    const p = await pairInfo();
+    const local = p.local === 'host' || p.local === 'prflx';
+    status(`Connected (${p.local} ↔ ${p.remote})${local ? ' — traffic is on your local network.' : ' — WARNING: not a local path.'}${role === 'anchor' ? ' Leave this screen on.' : ''}`, local ? 'good' : 'bad');
+    if (role === 'walker') { $('#walker').hidden = false; $('#go').disabled = false; }
+  };
+  ctrl.onmessage = async (e) => {
+    const m = JSON.parse(e.data);
+    if (waiters[m.t]) { waiters[m.t](m); delete waiters[m.t]; }
+    if (role !== 'anchor') return;
+    if (m.t === 'blast') { await blast(bulk, m.ms); ctrl.send(JSON.stringify({ t: 'blastDone' })); }
+    if (m.t === 'upStart') up = { bytes: 0, first: 0, last: 0 };
+    if (m.t === 'upDone') { await sleep(300); ctrl.send(JSON.stringify({ t: 'upResult', bytes: up.bytes, ms: up.last - up.first })); up = null; }
+  };
+  if (role === 'anchor') {
+    probe.onmessage = (e) => probe.send(e.data); // echo
+    bulk.onmessage = (e) => { if (!up) return; const t = performance.now(); if (!up.first) up.first = t; up.last = t; up.bytes += e.data.byteLength; };
+  }
+}
+
+async function pairInfo() {
+  const stats = await pc.getStats();
+  let pair;
+  stats.forEach((s) => { if (s.type === 'transport' && s.selectedCandidatePairId) pair = stats.get(s.selectedCandidatePairId); });
+  if (!pair) stats.forEach((s) => { if (s.type === 'candidate-pair' && s.nominated && s.state === 'succeeded') pair = s; });
+  if (!pair) return { local: '?', remote: '?' };
+  return {
+    local: stats.get(pair.localCandidateId)?.candidateType,
+    remote: stats.get(pair.remoteCandidateId)?.candidateType,
+    rtt: pair.currentRoundTripTime,
+    outBitrate: pair.availableOutgoingBitrate,
+  };
+}
+
+async function blast(ch, ms) {
+  const chunk = new Uint8Array(16384);
+  const end = performance.now() + ms;
+  ch.bufferedAmountLowThreshold = 1 << 20;
+  while (performance.now() < end) {
+    if (ch.bufferedAmount > 4 << 20) { await new Promise((r) => ch.addEventListener('bufferedamountlow', r, { once: true })); continue; }
+    ch.send(chunk);
+  }
+  while (ch.bufferedAmount > 0) await sleep(50);
+}
+
+async function probes(n, everyMs) {
+  const rtt = new Array(n).fill(null);
+  probe.onmessage = (e) => { const v = new Float64Array(e.data); rtt[v[0]] = performance.now() - v[1]; };
+  for (let i = 0; i < n; i++) { probe.send(new Float64Array([i, performance.now()]).buffer); await sleep(everyMs); }
+  await sleep(1000);
+  probe.onmessage = null;
+  const got = rtt.filter((x) => x !== null);
+  const sorted = [...got].sort((a, b) => a - b);
+  let jit = 0;
+  for (let i = 1; i < got.length; i++) jit += Math.abs(got[i] - got[i - 1]);
+  return {
+    rtt: +(sorted[Math.floor(sorted.length / 2)] ?? NaN).toFixed(1),
+    jitter: +(got.length > 1 ? jit / (got.length - 1) : NaN).toFixed(1),
+    loss: +((1 - got.length / n) * 100).toFixed(1),
+  };
+}
+
+function download(ms) {
+  return new Promise((resolve) => {
+    let bytes = 0, first = 0, last = 0;
+    bulk.onmessage = (e) => { const t = performance.now(); if (!first) first = t; last = t; bytes += e.data.byteLength; };
+    ctrlWait('blastDone').then(async () => { await sleep(300); bulk.onmessage = null; resolve(+((bytes * 8) / ((last - first) * 1000)).toFixed(1)); });
+    ctrl.send(JSON.stringify({ t: 'blast', ms }));
+  });
+}
+
+async function upload(ms) {
+  ctrl.send(JSON.stringify({ t: 'upStart' }));
+  await blast(bulk, ms);
+  ctrl.send(JSON.stringify({ t: 'upDone' }));
+  const r = await ctrlWait('upResult');
+  return +((r.bytes * 8) / (r.ms * 1000)).toFixed(1);
+}
+
+async function testRoom() {
+  const room = $('#room').value.trim() || `Room ${results.length + 1}`;
+  $('#go').disabled = true;
+  status(`Testing ${room}: latency…`);
+  const p = await probes(150, 20);
+  status(`Testing ${room}: download…`);
+  const down = await download(4000);
+  status(`Testing ${room}: upload…`);
+  const upMbps = await upload(4000);
+  const info = await pairInfo();
+  const r = { room, ...p, down, up: upMbps, path: `${info.local}↔${info.remote}`, statsRtt: info.rtt, at: new Date().toISOString() };
+  results.push(r);
+  log(JSON.stringify(r));
+  $('#rows').insertAdjacentHTML('beforeend', `<tr><td>${room}</td><td>${r.rtt}</td><td>${r.jitter}</td><td>${r.loss}</td><td>${r.down}</td><td>${r.up}</td><td>${r.path}</td></tr>`);
+  status(`Done: ${room}. Walk to the next Room and test again.`, 'good');
+  $('#room').value = '';
+  $('#go').disabled = false;
+}
+
+function copyResults() {
+  const text = JSON.stringify({ ua: navigator.userAgent, results }, null, 2);
+  navigator.clipboard?.writeText(text).then(() => alert('Copied'), () => prompt('Copy:', text)) ?? prompt('Copy:', text);
+}
+</script>
+</body>
+</html>
